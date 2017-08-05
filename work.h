@@ -1,6 +1,8 @@
 #ifndef WORK_H
 #define WORK_H
 
+#include <sys/types.h>
+
 #define CLIENTCOUNT 256
 #define BODYBUF 1024
 
@@ -25,13 +27,17 @@ private:
 	int socket_accept();
 	int socket_recv(int sock);
 	// client socket连接断开
-	void user_logout(int);
+	void user_logout(int sock);
 	// send消息
-	void send_msg(const char *, int);
+	void send_msg(const struct msg_t *msg, ssize_t msglen);
 	// login消息
-	void login_msg(int, int, const char*);
+	void login_msg(int sock, int o_userid, const char *passwd);
+	// 验证密
+	int auth_passwd(int userid, const char * passwd);
 	// 将accept的客户端连接安装到socket_client[10]的数组中
 	void fix_socket_client(int index, int sock);
+	// 向socket_client数组中所有client广播用户状态消息
+	void broadcast_user_status();
 };
 
 

@@ -1,7 +1,6 @@
 #include "work.h"
 #include "pub.h"
 #include <sys/epoll.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 
@@ -13,6 +12,8 @@ work::work(int port){
 }
 
 work::~work(){
+	if(listen_fd)
+		close(listen_fd);
 }
 
 int work::socket_accept(){
@@ -28,6 +29,22 @@ int work::socket_accept(){
 	return client_sock;
 }
 
+void work::send_msg(const struct msg_t *msg, ssize_t msglen){	
+	if((msg->head[2] < 0) || (msg->head[2] >= CLIENTCOUNT)){
+		// 没有这个目标用户
+		printf("%d: have not this userid\n", msg->head[2]);
+	}else{
+		// 目的user不在线
+		if(socket_client[msg->head[2]] == 0){
+			printf("%d: userid not online\n", msg->head[2]);
+		}else{
+			// 给client端socket
+			send(socket_client[msg->head[2]], (const char*)msg, msglen, 0);
+			printf("send message: %d to %d-%s\n", msg->head[1], msg->head[2], msg->body);
+		}
+	}
+}
+
 void work::login_msg(int sock, int o_userid, const char *passwd){
 	struct msg_t msg;
 	memset(&msg, 0, sizeof(msg));
@@ -35,24 +52,98 @@ void work::login_msg(int sock, int o_userid, const char *passwd){
 	msg.head[2] = 0;	// 保留
 	msg.head[3] = 0;	// 保留
 
+//	printf("%d", strlen(passwd));
+/*	for(int i=0;i<strlen(passwd);++i){
+		printf("%s", passwd[i]);
+	}
+*/
 	if((o_userid < 0) || (o_userid >= CLIENTCOUNT)){
 		printf("login failed, %d: invalid userid\n", o_userid);
 		msg.head[1] = 1;	// 无效userid
-		send(sock, (const char*)&msg, sizeof(msg), 0);
+		send(sock, (const char*)&msg, sizeof(msg.head), 0);
 		close(sock);
 		return;
 	}
 	// 验证用户登陆ID和密码
+	
 	if(!auth_passwd(o_userid, passwd)){
-		
+		printf("login failed, userid=%d: invalid password\n", o_userid);
+		msg.head[1] = 2; // 无效密码
+		// 给client端socket下发系统消息
+		send(sock, (const char*)&msg, sizeof(msg.head), 0);
+		// 验证失败，关闭client socket，函数返回
+		close(sock);	
+		return;
+	}
+
+	printf("%d: login success!\n", o_userid);
+	// 将登陆密码验证通过的client安装到socket_client[]数组中
+	fix_socket_client(o_userid, sock);
+	// 向socket_client数组中所有socket广播用户状态消息
+	broadcast_user_status();
+}
+
+int work::auth_passwd(int userid, const char *passwd){
+//	printf("%d\n", strncmp(passwd, "123456", 6));
+	if(strncmp(passwd, "123456", 6) == 0)
+		return 1;
+	else
+		return 0;
+}
+
+void work::fix_socket_client(int index, int sock){
+	// 同一个userid没有下线，却又在另一个终端登陆，拒绝登陆
+	if(socket_client[index] != 0){
+		printf("%d: userid already login!\n", index);
+		struct msg_t msg;
+		memset(&msg, 0, sizeof(msg));
+		msg.head[0] = 2;	// 系统消息
+		msg.head[1] = 3;	// userid已经登陆
+		msg.head[2] = 0;
+		msg.head[3] = 0;
+		send(sock, (char *)&msg, sizeof(msg.head), 0);
+		close(sock);
+	}else{
+		// 如果socket_client[index]等于0，将client端socket赋给socket_client[index]
+		socket_client[index] = sock;
 	}
 }
+
+void work::broadcast_user_status(){
+	struct msg_t msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.head[0] = 1;	// 设置消息类型为用户状态消息
+
+	for(int i=0; i<CLIENTCOUNT; ++i){
+		if(socket_client[i] != 0){
+			msg.body[i] = '1';	// 设置相应userid状态为在线
+		}else{
+			msg.body[i] = '0';	// 设置相应userid状态为离线
+		}
+	}
+	// 向socket_client数组中每个client广播用户状态信息
+	for(int i=0; i<CLIENTCOUNT; ++i){
+		if(socket_client[i] != 0){
+			send(socket_client[i], &msg, strlen(msg.body)+sizeof(msg.head), 0);
+			printf("%d: broadcast, %s\n", i, msg.body);
+		}
+	}
+}
+
 
 int work::socket_recv(int sock){
 	struct msg_t msg;
 	memset(&msg, 0, sizeof(msg));
 	//接收来自client socket发送来的消息
-	ssize_t recv_len = recv(sock, (char *)&msg, sizeof(msg));
+	ssize_t recv_len = recv(sock, (char *)&msg, sizeof(msg), 0);
+
+//	printf("%d", sizeof(msg.body)/sizeof(msg.body[0]));
+//	printf("msg.head[2] = %d\n", msg.head[2]);
+/*	int size = sizeof(msg.head)/sizeof(msg.head[0]);
+	for(int i=0; i<size; i++){
+		printf("%s", msg.head[i]);
+	}
+*/
 	if(recv_len <= 0){
 		if(recv_len < 0){
 			perror("receive failed:");
@@ -62,8 +153,8 @@ int work::socket_recv(int sock){
 			case 0:		// send消息
 				send_msg(&msg, recv_len);
 				break;
-			case 1:		// login消息
-				login_msg(socket, msg.head[1], msg.body);
+			case 1: 	// login消息
+				login_msg(sock, msg.head[1], msg.body);
 				break;
 			default:	// 无法识别的消息
 				printf("loging fail, it's not login message, %s\n", (const char*)&msg);
@@ -81,7 +172,15 @@ int work::socket_recv(int sock){
 }
 
 void work::user_logout(int sock){
-	
+	for(int i=0; i< CLIENTCOUNT; ++i){
+		if(socket_client[i] == sock){
+			printf("userid = %d, socket disconnect\n", i);
+			close(socket_client[i]);
+			socket_client[i] = 0;
+			broadcast_user_status();
+			return;
+		}
+	}
 }
 
 int work::setnonblocking(int sock){
